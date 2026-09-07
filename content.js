@@ -83,7 +83,9 @@
         publisher: verified.publisher || row.publisher,
         storeUrl: verified.storeUrl || row.storeUrl,
         publisherEmail: verified.publisherEmail || "",
-        publisherLinkedIn: verified.publisherLinkedIn || ""
+        publisherLinkedIn: verified.publisherLinkedIn || "",
+        website: verified.website || "",
+        accountType: verified.accountType || ""
       };
     });
   }

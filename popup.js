@@ -23,9 +23,11 @@ function csvValue(value) {
 function toCsv(rows) {
   // Column order matches the destination sheet so a row pastes straight in.
   const header = ["Release Date", "Company LinkedIn", "Game", "Developer Name",
-                  "Country", "Email", "Phone Number", "Number of Games"];
+                  "Country", "Email", "Phone Number", "Number of Games",
+                  "Website", "Type"];
   return [header, ...rows.map((game) => [game.releaseDate, game.publisherLinkedIn, game.game,
-    game.publisher, game.country, game.publisherEmail, game.phone, game.gameCount])]
+    game.publisher, game.country, game.publisherEmail, game.phone, game.gameCount,
+    game.website, game.accountType])]
     .map((row) => row.map(csvValue).join(","))
     .join("\r\n");
 }

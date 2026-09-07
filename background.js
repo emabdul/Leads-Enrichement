@@ -14,6 +14,60 @@ function firstMatch(text, patterns) {
 
 const LEGAL_SUFFIX = /[,.]?\s+(oyj|oy|ab|as|ltd|limited|inc|llc|corp|corporation|co|company|gmbh|ug|bv|nv|sa|srl|sarl|spa|plc|pte|pty|kk|aps|ehf|ooo|sdn|bhd)\.?$/i;
 
+const FREE_EMAIL = new Set(["gmail.com", "googlemail.com", "hotmail.com",
+  "outlook.com", "outlook.co.uk", "yahoo.com", "yahoo.co.jp", "yandex.ru",
+  "mail.ru", "163.com", "126.com", "qq.com", "foxmail.com", "naver.com",
+  "daum.net", "icloud.com", "me.com", "proton.me", "protonmail.com",
+  "live.com", "aol.com", "gmx.com", "gmx.de", "web.de", "zoho.com"]);
+
+function accountType(email) {
+  // A free mailbox almost always means a solo developer; a domain of
+  // their own means a company. The two need different LinkedIn searches.
+  const domain = String(email || "").toLowerCase().split("@")[1];
+  if (!domain) return "";
+  return FREE_EMAIL.has(domain) ? "Individual" : "Company";
+}
+
+function brandFromDomain(value) {
+  // colorbean.art -> colorbean ; www.mobirix.com -> mobirix
+  const match = String(value || "").toLowerCase()
+    .replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[/?#]/)[0];
+  if (!match || !match.includes(".")) return "";
+  const parts = match.split(".");
+  // Drop a country second-level like .co.uk before taking the label.
+  const cut = parts.length > 2 && parts[parts.length - 2].length <= 3
+    ? parts.length - 3 : parts.length - 2;
+  return parts[Math.max(0, cut)] || "";
+}
+
+function linkedInFor(publisher, email, website) {
+  const type = accountType(email);
+  const name = String(publisher || "").trim();
+  if (!name) return "";
+
+  if (type === "Individual") {
+    // A company search for a person's name returns nothing useful.
+    return "https://www.linkedin.com/search/results/people/?keywords="
+      + encodeURIComponent(name);
+  }
+
+  // Long registered names ("... bilisim hizmetleri sanayi ve ticaret
+  // limited sirketi") search badly; the website brand is the better term.
+  let keywords = linkedInKeywords(name);
+  const brand = brandFromDomain(website) || brandFromDomain(email);
+  if (brand && keywords.split(/\s+/).length > 4) keywords = brand;
+  return "https://www.linkedin.com/search/results/companies/?keywords="
+    + encodeURIComponent(keywords || brand || name);
+}
+
+function linkedInKeywords(publisher) {
+  let name = String(publisher || "").trim();
+  for (let pass = 0; pass < 3 && LEGAL_SUFFIX.test(name); pass += 1) {
+    name = name.replace(LEGAL_SUFFIX, "").trim();
+  }
+  return name.replace(/[,\s]+$/, "");
+}
+
 function linkedInSearchFor(publisher) {
   let name = (publisher || "").trim();
   for (let pass = 0; pass < 3 && LEGAL_SUFFIX.test(name); pass += 1) {
@@ -67,9 +121,31 @@ function playContact(html) {
     }
   }
   const address = full ? decodeHtml(full[3]).replace(/\\n/g, ", ").trim() : "";
+  // The developer's own site. Screenshot hosts, video thumbnails and asset
+  // CDNs all appear as absolute URLs in this markup, so they are excluded and
+  // anything that looks like an image file is rejected outright.
+  const IGNORE_HOST = /(?:^|\.)(?:google|gstatic|googleusercontent|youtube|ytimg|ggpht|w3|schema|doubleclick|googleapis)\./i;
+  const IMAGE_FILE = /\.(?:png|jpe?g|gif|webp|svg|ico|mp4|webm)(?:[?#]|$)/i;
+  let website = "";
+  for (const match of html.matchAll(/"(https?:\/\/[a-z0-9.-]+\.[a-z]{2,}[^"]{0,80})"/gi)) {
+    const url = decodeHtml(match[1]).trim();
+    const host = url.replace(/^https?:\/\//, "").split(/[/?#]/)[0];
+    if (IGNORE_HOST.test(host) || IMAGE_FILE.test(url)) continue;
+    website = url;
+    break;
+  }
+  const emailAddress = (verified ? decodeHtml(verified[2]).trim() : "") || supportEmail;
+  if (!website) {
+    // Nothing declared: their own mail domain is the next best lead, but only
+    // when it is actually theirs rather than a free mailbox.
+    const domain = String(emailAddress).toLowerCase().split("@")[1];
+    if (domain && !FREE_EMAIL.has(domain)) website = "https://" + domain;
+  }
+
   return {
     publisherEmail: (verified ? decodeHtml(verified[2]).trim() : "") || supportEmail,
     legalName: verified ? decodeHtml(verified[1]).trim() : "",
+    website,
     address,
     country: countryFrom(address),
     phone: full ? decodeHtml(full[4]).trim() : ""
@@ -132,11 +208,14 @@ async function resolveMetadata(app) {
           publisher: result.artistName || "",
           storeUrl: result.trackViewUrl || "",
           publisherEmail: "",
+          website: result.sellerUrl || "",
           country: "",
           phone: "",
           gameCount: stats.gameCount,
           developerUrl: stats.developerUrl,
-          publisherLinkedIn: linkedInSearchFor(result.sellerName || result.artistName || "")
+          accountType: result.sellerUrl ? "Company" : "",
+          publisherLinkedIn: linkedInFor(result.artistName || result.sellerName || "",
+                                         "", result.sellerUrl || "")
         };
       } else {
         metadata = {};
@@ -151,12 +230,15 @@ async function resolveMetadata(app) {
         storeUrl: `https://play.google.com/store/apps/details?id=${app.id}`,
         publisherEmail: contact.publisherEmail,
         country: contact.country,
-        phone: contact.phone
+        phone: contact.phone,
+        website: contact.website
       };
       const stats = await developerStats("Google Play", metadata.publisher, "");
       metadata.gameCount = stats.gameCount;
       metadata.developerUrl = stats.developerUrl;
-      metadata.publisherLinkedIn = linkedInSearchFor(metadata.publisher);
+      metadata.accountType = accountType(metadata.publisherEmail);
+      metadata.publisherLinkedIn = linkedInFor(metadata.publisher,
+        metadata.publisherEmail, metadata.website);
     }
     metadataCache.set(key, metadata);
     return metadata;
@@ -183,7 +265,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // ---------------------------------------------------------------- Google Sheet
 
 const SHEET_HEADERS = ["Release Date", "Company LinkedIn", "Game", "Developer Name",
-                       "Country", "Email", "Phone Number", "Number of Games"];
+                       "Country", "Email", "Phone Number", "Number of Games",
+                       "Website", "Type"];
+const LAST_COLUMN = "J";
+const COLUMN_COUNT = SHEET_HEADERS.length;
 
 function sheetIdFrom(url) {
   const match = String(url || "").match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
@@ -289,7 +374,7 @@ async function appendToSheet(sheetUrl, games) {
 
   let token = await authToken(true);
   const read = async () => sheetsCall(token,
-    `${spreadsheetId}/values/A:H?valueRenderOption=FORMULA&dateTimeRenderOption=FORMATTED_STRING`);
+    `${spreadsheetId}/values/A:${LAST_COLUMN}?valueRenderOption=FORMULA&dateTimeRenderOption=FORMATTED_STRING`);
   let existing;
   try {
     existing = await read();
@@ -342,7 +427,8 @@ async function appendToSheet(sheetUrl, games) {
     hyperlink(game.storeUrl, game.game),
     hyperlink(game.developerUrl, game.publisher),
     game.country || "", game.publisherEmail || "",
-    game.phone || "", game.gameCount || ""
+    game.phone || "", game.gameCount || "",
+    game.website || "", game.accountType || accountType(game.publisherEmail)
   ]);
 
   const properties = await sheetMeta(token, spreadsheetId);
@@ -399,7 +485,7 @@ async function appendToSheet(sheetUrl, games) {
         }]
       })
     });
-    const a1 = `${sheetName}!A${startRow + 1}:H${startRow + block.length}`;
+    const a1 = `${sheetName}!A${startRow + 1}:${LAST_COLUMN}${startRow + block.length}`;
     await sheetsCall(token,
       `${spreadsheetId}/values/${encodeURIComponent(a1)}?valueInputOption=USER_ENTERED`, {
         method: "PUT",
@@ -425,7 +511,7 @@ async function paintRows(token, spreadsheetId, sheetId, headerOffset,
   const fill = (start, end, colour) => ({
     repeatCell: {
       range: { sheetId, startRowIndex: start, endRowIndex: end,
-               startColumnIndex: 0, endColumnIndex: 8 },
+               startColumnIndex: 0, endColumnIndex: COLUMN_COUNT },
       cell: { userEnteredFormat: { backgroundColor: colour } },
       fields: "userEnteredFormat.backgroundColor"
     }
