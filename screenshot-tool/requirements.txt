@@ -1,0 +1,10 @@
+google-play-scraper>=1.2.7
+requests>=2.31
+pillow>=10.0
+
+# OCR engine. rapidocr needs no system install and is the default pick.
+rapidocr-onnxruntime>=1.2,<2
+
+# Alternative OCR engine. Needs the separate Tesseract binary installed too:
+#   https://github.com/UB-Mannheim/tesseract/wiki
+# pytesseract>=0.3.10

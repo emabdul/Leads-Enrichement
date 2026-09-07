@@ -1,0 +1,13 @@
+# Python virtualenv and caches
+screenshot-tool/.venv/
+**/__pycache__/
+*.pyc
+
+# Generated output
+*.xlsx
+*.csv
+screenshot-tool/test_cards*.png
+
+# Editor backups from patching
+*.bak
+*.bak[0-9]
