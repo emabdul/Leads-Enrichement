@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "AppBird Game Exporter",
+  "version": "1.0.0",
+  "description": "Exports visible AppBird game names, publishers, and detail links to CSV.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "identity",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://appbird.ai/*",
+    "https://itunes.apple.com/*",
+    "https://play.google.com/*",
+    "https://sheets.googleapis.com/*"
+  ],
+  "action": {
+    "default_title": "Export AppBird games",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://appbird.ai/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo78PUp2Z6xc0RtwTNKNafHz2/4HaoiDrVvXhT2cF8Ixzw+wb8R6a8+rXtbRL0SOzNkzTu93AfR876Il9Uf7ZpD+ttUKyV1S1SNnZjLCRTSnU8IoNLYM5x6yS5gzW+GeuxpMG94e+09R4phBs7eJPQm+bEmUWrd6gRaFYSwcGrunyl+dymxM9zIDM+UbfV2VBe9KtIGWDCzP3Fe9MXnXb/npVylGazl05f/WfBXzi8YrxqSF0j87R9d4R4eKvv61KykN1WK0r+OeAcbRZPcBKZByFfTVClCNzPg5NpyAK5hIyoyd5lafiSTXuCABueFslMUa096iQ+nYdqG51XLPKPwIDAQAB",
+  "oauth2": {
+    "client_id": "716581046625-mffmk68979ba2r3ljf7079ocall2jgco.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/spreadsheets"
+    ]
+  }
+}

@@ -1,0 +1,95 @@
+(() => {
+  const clean = (value) => (value || "").replace(/\s+/g, " ").trim();
+  const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+  function releaseDateFor(card) {
+    const releaseGroup = card.closest("[data-index]");
+    const text = clean(releaseGroup?.innerText);
+    const match = text.match(/\b([A-Z][a-z]{2})\s+(\d{1,2})(?:st|nd|rd|th)?,\s+(\d{4})\b/);
+    if (!match) return "";
+
+    const [, month, day, year] = match;
+    return new Date(`${month} ${day}, ${year} UTC`).toISOString().slice(0, 10);
+  }
+
+  function storeLinkFor(appId) {
+    if (/^\d+$/.test(appId)) {
+      return { store: "App Store", storeUrl: `https://apps.apple.com/app/id${appId}` };
+    }
+
+    return {
+      store: "Google Play",
+      storeUrl: `https://play.google.com/store/apps/details?id=${appId}`
+    };
+  }
+
+  async function extractGames() {
+    const seen = new Set();
+    const games = [];
+
+    function collectVisibleCards() {
+      const cards = [...document.querySelectorAll('a[href^="/apps/"]')];
+      for (const card of cards) {
+      const gameElement = card.querySelector('[title$="Store Page"]');
+      const publisherElement = card.querySelector('[title$="Developer Page"]');
+      const image = card.querySelector('img[alt]');
+      const game = clean(gameElement?.textContent) || clean(image?.alt) || "";
+      const publisher = clean(publisherElement?.textContent);
+      const relativeUrl = card.getAttribute("href");
+      const appId = relativeUrl.split("/").pop();
+      const { store, storeUrl } = storeLinkFor(appId);
+      const key = storeUrl;
+
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      games.push({
+        releaseDate: releaseDateFor(card),
+        game: game || `Locked app (${appId})`,
+        publisher,
+        store,
+        storeUrl,
+        appId
+      });
+      }
+    }
+
+    const originalScrollY = window.scrollY;
+    collectVisibleCards();
+    for (let step = 0; step < 80; step += 1) {
+      const before = window.scrollY;
+      window.scrollBy(0, Math.max(window.innerHeight * 2, 700));
+      await pause(250);
+      collectVisibleCards();
+      const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+      if (atBottom || window.scrollY === before) break;
+    }
+    window.scrollTo(0, originalScrollY);
+
+    const metadata = await chrome.runtime.sendMessage({
+      type: "APPBIRD_STORE_METADATA",
+      apps: games.map(({ appId, store }) => ({ id: appId, store }))
+    });
+    return games.map((game) => {
+      const verified = metadata?.results?.[game.appId] || {};
+      const { appId, ...row } = game;
+      return {
+        ...row,
+        game: verified.game || row.game,
+        publisher: verified.publisher || row.publisher,
+        storeUrl: verified.storeUrl || row.storeUrl,
+        publisherEmail: verified.publisherEmail || "",
+        publisherLinkedIn: verified.publisherLinkedIn || ""
+      };
+    });
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "APPBIRD_EXPORT_GAMES") return;
+
+    extractGames()
+      .then((games) => sendResponse({ games, pageUrl: location.href, scannedAt: new Date().toISOString() }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  });
+})();

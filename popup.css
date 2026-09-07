@@ -1,0 +1,16 @@
+:root { color: #202124; font: 14px/1.4 system-ui, sans-serif; }
+body { width: 300px; margin: 0; }
+main { padding: 16px; }
+h1 { font-size: 17px; margin: 0 0 8px; }
+p { margin: 0 0 12px; }
+button { width: 100%; border: 0; border-radius: 6px; padding: 9px 10px; margin-top: 8px; color: white; background: #1677ff; cursor: pointer; font-weight: 600; }
+button:hover:not(:disabled) { background: #0f62d4; }
+button:disabled { cursor: not-allowed; background: #b7bec8; }
+.note { color: #5f6368; font-size: 12px; margin-top: 14px; }
+.field { display: block; margin-top: 14px; font-size: 12px; font-weight: 600; color: #3c4043; }
+input[type="url"] { width: 100%; box-sizing: border-box; margin-top: 4px; padding: 7px 8px; border: 1px solid #c4c9d0; border-radius: 6px; font: inherit; font-size: 12px; }
+input[type="url"]:focus { outline: 2px solid #1677ff; outline-offset: -1px; border-color: #1677ff; }
+details { margin-top: 16px; border-top: 1px solid #e6e8eb; padding-top: 10px; }
+summary { cursor: pointer; font-size: 12px; color: #5f6368; }
+.ok { color: #137333; }
+.bad { color: #c5221f; }

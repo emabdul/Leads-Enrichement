@@ -1,0 +1,303 @@
+const metadataCache = new Map();
+
+function decodeHtml(value = "") {
+  return value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+
+function firstMatch(text, patterns) {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return decodeHtml(match[1].trim());
+  }
+  return "";
+}
+
+const LEGAL_SUFFIX = /[,.]?\s+(oyj|oy|ab|as|ltd|limited|inc|llc|corp|corporation|co|company|gmbh|ug|bv|nv|sa|srl|sarl|spa|plc|pte|pty|kk|aps|ehf|ooo|sdn|bhd)\.?$/i;
+
+function linkedInSearchFor(publisher) {
+  let name = (publisher || "").trim();
+  for (let pass = 0; pass < 3 && LEGAL_SUFFIX.test(name); pass += 1) {
+    name = name.replace(LEGAL_SUFFIX, "").trim();
+  }
+  name = name.replace(/[,\s]+$/, "");
+  if (!name) return "";
+  return `https://www.linkedin.com/search/results/companies/?keywords=${encodeURIComponent(name)}`;
+}
+
+const COUNTRIES = ["United States","United Kingdom","United Arab Emirates","South Korea",
+  "Korea","Hong Kong","Singapore","India","Japan","China","Taiwan","Vietnam","Viet Nam",
+  "Thailand","Indonesia","Malaysia","Philippines","Pakistan","Bangladesh","Sri Lanka",
+  "Nepal","Turkey","T\u00fcrkiye","Cyprus","Israel","Egypt","Morocco","Nigeria","Kenya",
+  "South Africa","Australia","New Zealand","Canada","Mexico","Brazil","Argentina","Chile",
+  "Colombia","Peru","Germany","France","Spain","Portugal","Italy","Netherlands","Belgium",
+  "Switzerland","Austria","Sweden","Norway","Denmark","Finland","Iceland","Ireland",
+  "Poland","Czechia","Czech Republic","Slovakia","Hungary","Romania","Bulgaria","Greece",
+  "Croatia","Slovenia","Serbia","Ukraine","Belarus","Russia","Kazakhstan","Uzbekistan",
+  "Azerbaijan","Georgia","Armenia","Estonia","Latvia","Lithuania","Luxembourg","Malta",
+  "Monaco","Cayman Islands","British Virgin Islands","Seychelles","Mauritius","Panama",
+  "Uruguay","Saudi Arabia","Qatar","Kuwait","Bahrain","Oman","Jordan","Lebanon"];
+const COUNTRY_ALIAS = { "Viet Nam": "Vietnam", "Korea": "South Korea",
+  "T\u00fcrkiye": "Turkey", "Czechia": "Czech Republic" };
+
+function countryFrom(address) {
+  // The longest name wins so "United States" beats "States" and
+  // "Hong Kong" beats "Kong".
+  let best = "";
+  for (const name of COUNTRIES) {
+    const re = new RegExp("(?<![A-Za-z])" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![A-Za-z])", "i");
+    if (re.test(address) && name.length > best.length) best = name;
+  }
+  return COUNTRY_ALIAS[best] || best;
+}
+
+function playContact(html) {
+  // Google Play's "About the developer" block, mandatory for all developers since 2023:
+  // ["Legal name",["developer@example.com"],["street address"],"phone"]
+  // Capturing all four fields yields Country and Phone Number as well.
+  const full = html.match(/\["([^"]{1,80})",\["([^"@]+@[^"]+)"\],\["([^"]{0,220})"\],"([^"]{0,40})"/);
+  const verified = full || html.match(/\["([^"]{1,80})",\["([^"@]+@[^"]+)"\],\[/);
+  // An app page carries exactly one mailto:, the one labelled "Support email".
+  const support = html.match(/href="mailto:([^"?]+)"/);
+  let supportEmail = "";
+  if (support) {
+    try {
+      supportEmail = decodeHtml(decodeURIComponent(support[1])).trim();
+    } catch {
+      supportEmail = decodeHtml(support[1]).trim();
+    }
+  }
+  const address = full ? decodeHtml(full[3]).replace(/\\n/g, ", ").trim() : "";
+  return {
+    publisherEmail: (verified ? decodeHtml(verified[2]).trim() : "") || supportEmail,
+    legalName: verified ? decodeHtml(verified[1]).trim() : "",
+    address,
+    country: countryFrom(address),
+    phone: full ? decodeHtml(full[4]).trim() : ""
+  };
+}
+
+const developerCache = new Map();
+
+async function developerStats(store, publisher, artistId) {
+  // How many apps the developer has published. Cached per developer -
+  // a results page repeats the same publisher many times.
+  const key = `${store}:${artistId || publisher}`;
+  if (developerCache.has(key)) return developerCache.get(key);
+  let stats = { gameCount: "", developerUrl: "" };
+  try {
+    if (store === "App Store" && artistId) {
+      const response = await fetch(`https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=software&limit=200`);
+      const results = (await response.json()).results || [];
+      const apps = results.filter((item) => item.wrapperType === "software");
+      stats = {
+        gameCount: apps.length ? String(apps.length) : "",
+        developerUrl: (results[0]?.artistViewUrl || "").split("?")[0]
+      };
+    } else if (publisher) {
+      // Play caps public developer listings at 50, so a full house is
+      // reported as "50+" rather than a number that would understate it.
+      const query = encodeURIComponent(`pub:"${publisher}"`);
+      const html = await (await fetch(`https://play.google.com/store/search?q=${query}&c=apps&hl=en`)).text();
+      const ids = new Set();
+      for (const match of html.matchAll(/id=([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)+)/g)) {
+        const id = match[1];
+        if (!id.startsWith("com.google.") && !id.startsWith("com.android.")) ids.add(id);
+      }
+      stats = {
+        gameCount: ids.size ? (ids.size >= 50 ? "50+" : String(ids.size)) : "",
+        developerUrl: `https://play.google.com/store/apps/developer?id=${encodeURIComponent(publisher)}`
+      };
+    }
+  } catch {
+    // Leave the fields blank rather than guessing a count.
+  }
+  developerCache.set(key, stats);
+  return stats;
+}
+
+async function resolveMetadata(app) {
+  const key = `${app.store}:${app.id}`;
+  if (metadataCache.has(key)) return metadataCache.get(key);
+  try {
+    let metadata;
+    if (app.store === "App Store") {
+      const response = await fetch(`https://itunes.apple.com/lookup?id=${encodeURIComponent(app.id)}`);
+      const result = (await response.json()).results?.[0];
+      // The iTunes lookup API publishes no contact address, so email stays blank.
+      if (result) {
+        // Apple publishes no seller address, so country and phone stay blank.
+        const stats = await developerStats("App Store", result.artistName, result.artistId);
+        metadata = {
+          game: result.trackName || "",
+          publisher: result.artistName || "",
+          storeUrl: result.trackViewUrl || "",
+          publisherEmail: "",
+          country: "",
+          phone: "",
+          gameCount: stats.gameCount,
+          developerUrl: stats.developerUrl,
+          publisherLinkedIn: linkedInSearchFor(result.sellerName || result.artistName || "")
+        };
+      } else {
+        metadata = {};
+      }
+    } else {
+      const response = await fetch(`https://play.google.com/store/apps/details?id=${encodeURIComponent(app.id)}&hl=en`);
+      const html = await response.text();
+      const contact = playContact(html);
+      metadata = {
+        game: firstMatch(html, [/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i, /<meta[^>]+itemprop="name"[^>]+content="([^"]+)"/i]).replace(/\s+-\s+Apps on Google Play$/i, ""),
+        publisher: firstMatch(html, [/href="\/store\/apps\/dev(?:eloper)?\?id=[^"]+"[^>]*>(?:<[^>]+>)*\s*([^<]{1,80}?)\s*</i]) || contact.legalName,
+        storeUrl: `https://play.google.com/store/apps/details?id=${app.id}`,
+        publisherEmail: contact.publisherEmail,
+        country: contact.country,
+        phone: contact.phone
+      };
+      const stats = await developerStats("Google Play", metadata.publisher, "");
+      metadata.gameCount = stats.gameCount;
+      metadata.developerUrl = stats.developerUrl;
+      metadata.publisherLinkedIn = linkedInSearchFor(metadata.publisher);
+    }
+    metadataCache.set(key, metadata);
+    return metadata;
+  } catch {
+    return {};
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "APPBIRD_STORE_METADATA" || !sender.tab?.url?.startsWith("https://appbird.ai/")) return;
+  (async () => {
+    const results = {};
+    const apps = message.apps || [];
+    for (let index = 0; index < apps.length; index += 4) {
+      const batch = apps.slice(index, index + 4);
+      const metadata = await Promise.all(batch.map(resolveMetadata));
+      batch.forEach((app, itemIndex) => { results[app.id] = metadata[itemIndex]; });
+    }
+    sendResponse({ results });
+  })();
+  return true;
+});
+
+// ---------------------------------------------------------------- Google Sheet
+
+const SHEET_HEADERS = ["Release Date", "Company LinkedIn", "Game", "Developer Name",
+                       "Country", "Email", "Phone Number", "Number of Games"];
+
+function sheetIdFrom(url) {
+  const match = String(url || "").match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  return match ? match[1] : "";
+}
+
+function rowKey(game, developer) {
+  const flatten = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return `${flatten(game)}|${flatten(developer)}`;
+}
+
+async function authToken(interactive) {
+  return new Promise((resolve, reject) => {
+    chrome.identity.getAuthToken({ interactive }, (token) => {
+      if (chrome.runtime.lastError || !token) {
+        reject(new Error(chrome.runtime.lastError?.message || "not signed in"));
+        return;
+      }
+      resolve(token);
+    });
+  });
+}
+
+async function sheetsCall(token, path, options = {}) {
+  const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${path}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(options.headers || {}) }
+  });
+  if (!response.ok) {
+    // A 401 means the cached token went stale; the caller retries once with a fresh one.
+    const detail = await response.text();
+    const error = new Error(`Sheets API ${response.status}: ${detail.slice(0, 200)}`);
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+// Release dates arrive as YYYY-MM-DD; the sheet shows D/MM/YYYY.
+function sheetDate(value) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return value || "";
+  const [, year, month, day] = match;
+  return `${Number(day)}/${month}/${year}`;
+}
+
+function sortableDate(value) {
+  const iso = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return `${iso[1]}${iso[2]}${iso[3]}`;
+  const dmy = String(value || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (dmy) return `${dmy[3]}${dmy[2].padStart(2, "0")}${dmy[1].padStart(2, "0")}`;
+  return "";
+}
+
+async function appendToSheet(sheetUrl, games) {
+  const spreadsheetId = sheetIdFrom(sheetUrl);
+  if (!spreadsheetId) throw new Error("that does not look like a Google Sheet link");
+
+  let token = await authToken(true);
+  const read = async () => sheetsCall(token, `${spreadsheetId}/values/A:H`);
+  let existing;
+  try {
+    existing = await read();
+  } catch (error) {
+    if (error.status !== 401) throw error;
+    await new Promise((done) => chrome.identity.removeCachedAuthToken({ token }, done));
+    token = await authToken(true);
+    existing = await read();
+  }
+
+  const rows = existing.values || [];
+  const seen = new Set();
+  let firstRowIsHeader = false;
+  rows.forEach((row, index) => {
+    const game = row[2];
+    const developer = row[3];
+    if (index === 0 && String(game || "").toLowerCase() === "game") {
+      firstRowIsHeader = true;
+      return;
+    }
+    if (game) seen.add(rowKey(game, developer));
+  });
+
+  const fresh = games
+    .filter((game) => !seen.has(rowKey(game.game, game.publisher)))
+    .sort((left, right) => sortableDate(left.releaseDate).localeCompare(sortableDate(right.releaseDate)));
+
+  if (!fresh.length) return { added: 0, skipped: games.length, total: rows.length };
+
+  const values = fresh.map((game) => [
+    sheetDate(game.releaseDate), game.publisherLinkedIn || "", game.game || "",
+    game.publisher || "", game.country || "", game.publisherEmail || "",
+    game.phone || "", game.gameCount || ""
+  ]);
+
+  // Write the header only into a sheet that has none.
+  if (!rows.length && !firstRowIsHeader) values.unshift(SHEET_HEADERS);
+
+  await sheetsCall(token, `${spreadsheetId}/values/A:H:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
+    method: "POST",
+    body: JSON.stringify({ values })
+  });
+
+  return { added: fresh.length, skipped: games.length - fresh.length, total: rows.length + fresh.length };
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "APPBIRD_SEND_TO_SHEET") return;
+  (async () => {
+    try {
+      sendResponse({ result: await appendToSheet(message.sheetUrl, message.games || []) });
+    } catch (error) {
+      sendResponse({ error: error.message || String(error) });
+    }
+  })();
+  return true;
+});

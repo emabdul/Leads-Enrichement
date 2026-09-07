@@ -1,0 +1,97 @@
+const metadataCache = new Map();
+
+function decodeHtml(value = "") {
+  return value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+
+function firstMatch(text, patterns) {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return decodeHtml(match[1].trim());
+  }
+  return "";
+}
+
+const LEGAL_SUFFIX = /[,.]?\s+(oyj|oy|ab|as|ltd|limited|inc|llc|corp|corporation|co|company|gmbh|ug|bv|nv|sa|srl|sarl|spa|plc|pte|pty|kk|aps|ehf|ooo|sdn|bhd)\.?$/i;
+
+function linkedInSearchFor(publisher) {
+  let name = (publisher || "").trim();
+  for (let pass = 0; pass < 3 && LEGAL_SUFFIX.test(name); pass += 1) {
+    name = name.replace(LEGAL_SUFFIX, "").trim();
+  }
+  name = name.replace(/[,\s]+$/, "");
+  if (!name) return "";
+  return `https://www.linkedin.com/search/results/companies/?keywords=${encodeURIComponent(name)}`;
+}
+
+function playContact(html) {
+  // Google Play's "About the developer" block, mandatory for all developers since 2023:
+  // ["Legal name",["developer@example.com"],["street address"],"phone"]
+  const verified = html.match(/\["([^"]{1,80})",\["([^"@]+@[^"]+)"\],\[/);
+  // An app page carries exactly one mailto:, the one labelled "Support email".
+  const support = html.match(/href="mailto:([^"?]+)"/);
+  let supportEmail = "";
+  if (support) {
+    try {
+      supportEmail = decodeHtml(decodeURIComponent(support[1])).trim();
+    } catch {
+      supportEmail = decodeHtml(support[1]).trim();
+    }
+  }
+  return {
+    publisherEmail: (verified ? decodeHtml(verified[2]).trim() : "") || supportEmail,
+    legalName: verified ? decodeHtml(verified[1]).trim() : ""
+  };
+}
+
+async function resolveMetadata(app) {
+  const key = `${app.store}:${app.id}`;
+  if (metadataCache.has(key)) return metadataCache.get(key);
+  try {
+    let metadata;
+    if (app.store === "App Store") {
+      const response = await fetch(`https://itunes.apple.com/lookup?id=${encodeURIComponent(app.id)}`);
+      const result = (await response.json()).results?.[0];
+      // The iTunes lookup API publishes no contact address, so email stays blank.
+      metadata = result
+        ? {
+            game: result.trackName || "",
+            publisher: result.artistName || "",
+            storeUrl: result.trackViewUrl || "",
+            publisherEmail: "",
+            publisherLinkedIn: linkedInSearchFor(result.sellerName || result.artistName || "")
+          }
+        : {};
+    } else {
+      const response = await fetch(`https://play.google.com/store/apps/details?id=${encodeURIComponent(app.id)}&hl=en`);
+      const html = await response.text();
+      const contact = playContact(html);
+      metadata = {
+        game: firstMatch(html, [/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i, /<meta[^>]+itemprop="name"[^>]+content="([^"]+)"/i]).replace(/\s+-\s+Apps on Google Play$/i, ""),
+        publisher: firstMatch(html, [/href="\/store\/apps\/dev(?:eloper)?\?id=[^"]+"[^>]*>(?:<[^>]+>)*\s*([^<]{1,80}?)\s*</i]) || contact.legalName,
+        storeUrl: `https://play.google.com/store/apps/details?id=${app.id}`,
+        publisherEmail: contact.publisherEmail
+      };
+      metadata.publisherLinkedIn = linkedInSearchFor(metadata.publisher);
+    }
+    metadataCache.set(key, metadata);
+    return metadata;
+  } catch {
+    return {};
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "APPBIRD_STORE_METADATA" || !sender.tab?.url?.startsWith("https://appbird.ai/")) return;
+  (async () => {
+    const results = {};
+    const apps = message.apps || [];
+    for (let index = 0; index < apps.length; index += 4) {
+      const batch = apps.slice(index, index + 4);
+      const metadata = await Promise.all(batch.map(resolveMetadata));
+      batch.forEach((app, itemIndex) => { results[app.id] = metadata[itemIndex]; });
+    }
+    sendResponse({ results });
+  })();
+  return true;
+});

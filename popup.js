@@ -1,0 +1,203 @@
+const scanButton = document.querySelector("#scan");
+const downloadButton = document.querySelector("#download");
+const rebuildButton = document.querySelector("#rebuild");
+const status = document.querySelector("#status");
+let scannedGames = [];
+let pendingGames = [];
+let savedGames = [];
+
+async function loadSavedGames() {
+  const result = await chrome.storage.local.get("savedGames");
+  savedGames = Array.isArray(result.savedGames) ? result.savedGames : [];
+  status.textContent = savedGames.length
+    ? `${savedGames.length} game${savedGames.length === 1 ? "" : "s"} already saved.`
+    : "Open an AppBird results page, then scan it.";
+  rebuildButton.disabled = savedGames.length === 0;
+  document.querySelector("#send").disabled = savedGames.length === 0;
+}
+
+function csvValue(value) {
+  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+function toCsv(rows) {
+  // Column order matches the destination sheet so a row pastes straight in.
+  const header = ["Release Date", "Company LinkedIn", "Game", "Developer Name",
+                  "Country", "Email", "Phone Number", "Number of Games"];
+  return [header, ...rows.map((game) => [game.releaseDate, game.publisherLinkedIn, game.game,
+    game.publisher, game.country, game.publisherEmail, game.phone, game.gameCount])]
+    .map((row) => row.map(csvValue).join(","))
+    .join("\r\n");
+}
+
+scanButton.addEventListener("click", async () => {
+  status.textContent = "Scanning…";
+  downloadButton.disabled = true;
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.url?.startsWith("https://appbird.ai/")) {
+    status.textContent = "Please open an AppBird page first.";
+    return;
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tab.id, { type: "APPBIRD_EXPORT_GAMES" });
+    if (response?.error) throw new Error(response.error);
+    scannedGames = response?.games || [];
+    const savedByUrl = new Map(savedGames.map((game) => [game.storeUrl, game]));
+    const scannedByUrl = new Map();
+    let newCount = 0;
+    let updatedCount = 0;
+
+    for (const game of scannedGames) {
+      const existing = savedByUrl.get(game.storeUrl);
+      if (!existing) {
+        newCount += 1;
+        scannedByUrl.set(game.storeUrl, game);
+        continue;
+      }
+
+      const nonEmptyFields = Object.fromEntries(
+        Object.entries(game).filter(([, value]) => value !== "" && value !== undefined)
+      );
+      const merged = { ...existing, ...nonEmptyFields };
+      if (Object.entries(nonEmptyFields).some(([key, value]) => existing[key] !== value)) {
+        updatedCount += 1;
+      }
+      scannedByUrl.set(game.storeUrl, merged);
+    }
+
+    pendingGames = [
+      ...savedGames.map((game) => scannedByUrl.get(game.storeUrl) || game),
+      ...scannedGames.filter((game) => !savedByUrl.has(game.storeUrl))
+    ];
+    const existingCount = scannedGames.length - newCount - updatedCount;
+
+    status.textContent = scannedGames.length
+      ? `Found ${scannedGames.length}: ${newCount} new, ${updatedCount} enriched, ${existingCount} unchanged.`
+      : "No game cards found. Refresh the AppBird page and try again.";
+    downloadButton.disabled = newCount + updatedCount === 0;
+    // The sheet decides for itself what is missing, so allow a send after any scan.
+    document.querySelector("#send").disabled = scannedGames.length === 0;
+  } catch (error) {
+    status.textContent = `Could not scan: ${error.message || "refresh the AppBird page and try again."}`;
+  }
+});
+
+async function downloadCsv(rows) {
+  const encoded = btoa(unescape(encodeURIComponent(toCsv(rows))));
+  const downloadId = await chrome.downloads.download({
+    url: `data:text/csv;charset=utf-8;base64,${encoded}`,
+    filename: "AppBird Exports/appbird-games.csv",
+    conflictAction: "overwrite",
+    saveAs: false
+  });
+  const [download] = await chrome.downloads.search({ id: downloadId });
+  return download?.filename || "your Chrome Downloads folder";
+}
+
+downloadButton.addEventListener("click", async () => {
+  try {
+    const allGames = (pendingGames.length ? pendingGames : savedGames)
+      .sort((left, right) => {
+        const dateOrder = String(left.releaseDate || "").localeCompare(String(right.releaseDate || ""));
+        return dateOrder || String(left.game || "").localeCompare(String(right.game || ""));
+      });
+    const filename = await downloadCsv(allGames);
+    await chrome.storage.local.set({ savedGames: allGames });
+
+    savedGames = allGames;
+    pendingGames = [];
+    downloadButton.disabled = true;
+    rebuildButton.disabled = false;
+    status.textContent = `Saved ${savedGames.length} unique games to ${filename}`;
+  } catch (error) {
+    status.textContent = `Could not save CSV: ${error.message}`;
+  }
+});
+
+rebuildButton.addEventListener("click", async () => {
+  try {
+    const filename = await downloadCsv(savedGames);
+    status.textContent = `Saved ${savedGames.length} unique games to ${filename}`;
+  } catch (error) {
+    status.textContent = `Could not save CSV: ${error.message}`;
+  }
+});
+
+loadSavedGames();
+
+// ---------------------------------------------------------------- Google Sheet
+
+const sheetInput = document.querySelector("#sheetUrl");
+const sheetState = document.querySelector("#sheetState");
+const sendButton = document.querySelector("#send");
+
+function describeSheet(url) {
+  const id = String(url || "").match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (!url) {
+    sheetState.textContent = "Paste the sheet you want rows added to.";
+    sheetState.className = "note";
+    return false;
+  }
+  if (!id) {
+    sheetState.textContent = "That is not a Google Sheet link.";
+    sheetState.className = "note bad";
+    return false;
+  }
+  sheetState.textContent = `Ready to write to sheet ${id[1].slice(0, 12)}…`;
+  sheetState.className = "note ok";
+  return true;
+}
+
+chrome.storage.local.get("sheetUrl").then(({ sheetUrl }) => {
+  if (sheetUrl) sheetInput.value = sheetUrl;
+  describeSheet(sheetInput.value);
+});
+
+sheetInput.addEventListener("change", () => {
+  const url = sheetInput.value.trim();
+  describeSheet(url);
+  chrome.storage.local.set({ sheetUrl: url });
+});
+
+sendButton.addEventListener("click", async () => {
+  const sheetUrl = sheetInput.value.trim();
+  if (!describeSheet(sheetUrl)) {
+    sheetInput.focus();
+    return;
+  }
+  // Send everything scanned; the service worker decides what the sheet lacks.
+  const games = pendingGames.length ? pendingGames : (scannedGames.length ? scannedGames : savedGames);
+  if (!games.length) {
+    status.textContent = "Scan a page first.";
+    return;
+  }
+
+  sendButton.disabled = true;
+  status.textContent = "Signing in and checking the sheet…";
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "APPBIRD_SEND_TO_SHEET", sheetUrl, games
+    });
+    // An undefined reply means the service worker never answered - it
+    // crashed, or was not reloaded after a manifest change. Say so,
+    // rather than failing later on a property of undefined.
+    if (!response) {
+      throw new Error(chrome.runtime.lastError?.message
+        || "no reply from the extension background worker. Open chrome://extensions, click \"service worker\" under this extension, and read the error there.");
+    }
+    if (response.error) throw new Error(response.error);
+    if (!response.result) throw new Error(`unexpected reply: ${JSON.stringify(response).slice(0, 200)}`);
+    const { added, skipped } = response.result;
+    status.textContent = added
+      ? `Added ${added} new row${added === 1 ? "" : "s"} to the sheet (${skipped} already there).`
+      : `Nothing new — all ${skipped} rows are already in the sheet.`;
+    await chrome.storage.local.set({ savedGames: games });
+    savedGames = games;
+  } catch (error) {
+    status.textContent = `Could not write to the sheet: ${error.message}`;
+  } finally {
+    sendButton.disabled = false;
+  }
+});

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AppBird Game Exporter</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>AppBird Game Exporter</h1>
+      <p id="status">Open an AppBird results page, then scan it.</p>
+      <button id="scan">Scan visible games</button>
+      <button id="send" disabled>Add new rows to Google Sheet</button>
+
+      <label class="field" for="sheetUrl">Google Sheet link</label>
+      <input id="sheetUrl" type="url" placeholder="https://docs.google.com/spreadsheets/d/…" />
+      <p id="sheetState" class="note">Paste the sheet you want rows added to.</p>
+
+      <details>
+        <summary>CSV export</summary>
+        <button id="download" disabled>Save new / updated games to CSV</button>
+        <button id="rebuild" disabled>Download saved CSV</button>
+        <p class="note">Saved to Downloads/AppBird Exports/appbird-games.csv.</p>
+      </details>
+
+      <p class="note">New rows are appended under the last one, oldest first.
+        Anything already in the sheet is skipped. Locked cards are included when
+        their store ID is available.</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

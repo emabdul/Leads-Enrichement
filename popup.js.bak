@@ -1,0 +1,122 @@
+const scanButton = document.querySelector("#scan");
+const downloadButton = document.querySelector("#download");
+const rebuildButton = document.querySelector("#rebuild");
+const status = document.querySelector("#status");
+let scannedGames = [];
+let pendingGames = [];
+let savedGames = [];
+
+async function loadSavedGames() {
+  const result = await chrome.storage.local.get("savedGames");
+  savedGames = Array.isArray(result.savedGames) ? result.savedGames : [];
+  status.textContent = savedGames.length
+    ? `${savedGames.length} game${savedGames.length === 1 ? "" : "s"} already saved.`
+    : "Open an AppBird results page, then scan it.";
+  rebuildButton.disabled = savedGames.length === 0;
+}
+
+function csvValue(value) {
+  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+}
+
+function toCsv(rows) {
+  const header = ["Release Date", "Game", "Publisher", "Store", "Store URL", "Publisher Email", "Publisher LinkedIn"];
+  return [header, ...rows.map((game) => [game.releaseDate, game.game, game.publisher, game.store, game.storeUrl, game.publisherEmail, game.publisherLinkedIn])]
+    .map((row) => row.map(csvValue).join(","))
+    .join("\r\n");
+}
+
+scanButton.addEventListener("click", async () => {
+  status.textContent = "Scanning…";
+  downloadButton.disabled = true;
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.url?.startsWith("https://appbird.ai/")) {
+    status.textContent = "Please open an AppBird page first.";
+    return;
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tab.id, { type: "APPBIRD_EXPORT_GAMES" });
+    if (response?.error) throw new Error(response.error);
+    scannedGames = response?.games || [];
+    const savedByUrl = new Map(savedGames.map((game) => [game.storeUrl, game]));
+    const scannedByUrl = new Map();
+    let newCount = 0;
+    let updatedCount = 0;
+
+    for (const game of scannedGames) {
+      const existing = savedByUrl.get(game.storeUrl);
+      if (!existing) {
+        newCount += 1;
+        scannedByUrl.set(game.storeUrl, game);
+        continue;
+      }
+
+      const nonEmptyFields = Object.fromEntries(
+        Object.entries(game).filter(([, value]) => value !== "" && value !== undefined)
+      );
+      const merged = { ...existing, ...nonEmptyFields };
+      if (Object.entries(nonEmptyFields).some(([key, value]) => existing[key] !== value)) {
+        updatedCount += 1;
+      }
+      scannedByUrl.set(game.storeUrl, merged);
+    }
+
+    pendingGames = [
+      ...savedGames.map((game) => scannedByUrl.get(game.storeUrl) || game),
+      ...scannedGames.filter((game) => !savedByUrl.has(game.storeUrl))
+    ];
+    const existingCount = scannedGames.length - newCount - updatedCount;
+
+    status.textContent = scannedGames.length
+      ? `Found ${scannedGames.length}: ${newCount} new, ${updatedCount} enriched, ${existingCount} unchanged.`
+      : "No game cards found. Refresh the AppBird page and try again.";
+    downloadButton.disabled = newCount + updatedCount === 0;
+  } catch (error) {
+    status.textContent = `Could not scan: ${error.message || "refresh the AppBird page and try again."}`;
+  }
+});
+
+async function downloadCsv(rows) {
+  const encoded = btoa(unescape(encodeURIComponent(toCsv(rows))));
+  const downloadId = await chrome.downloads.download({
+    url: `data:text/csv;charset=utf-8;base64,${encoded}`,
+    filename: "AppBird Exports/appbird-games.csv",
+    conflictAction: "overwrite",
+    saveAs: false
+  });
+  const [download] = await chrome.downloads.search({ id: downloadId });
+  return download?.filename || "your Chrome Downloads folder";
+}
+
+downloadButton.addEventListener("click", async () => {
+  try {
+    const allGames = (pendingGames.length ? pendingGames : savedGames)
+      .sort((left, right) => {
+        const dateOrder = String(right.releaseDate || "").localeCompare(String(left.releaseDate || ""));
+        return dateOrder || String(left.game || "").localeCompare(String(right.game || ""));
+      });
+    const filename = await downloadCsv(allGames);
+    await chrome.storage.local.set({ savedGames: allGames });
+
+    savedGames = allGames;
+    pendingGames = [];
+    downloadButton.disabled = true;
+    rebuildButton.disabled = false;
+    status.textContent = `Saved ${savedGames.length} unique games to ${filename}`;
+  } catch (error) {
+    status.textContent = `Could not save CSV: ${error.message}`;
+  }
+});
+
+rebuildButton.addEventListener("click", async () => {
+  try {
+    const filename = await downloadCsv(savedGames);
+    status.textContent = `Saved ${savedGames.length} unique games to ${filename}`;
+  } catch (error) {
+    status.textContent = `Could not save CSV: ${error.message}`;
+  }
+});
+
+loadSavedGames();
