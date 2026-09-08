@@ -68,7 +68,7 @@
 
     const metadata = await chrome.runtime.sendMessage({
       type: "APPBIRD_STORE_METADATA",
-      apps: games.map(({ appId, store }) => ({ id: appId, store }))
+      apps: games.map(({ appId, store, game }) => ({ id: appId, store, name: game }))
     });
     return games.map((game) => {
       const verified = metadata?.results?.[game.appId] || {};

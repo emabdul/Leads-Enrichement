@@ -1,5 +1,32 @@
 const metadataCache = new Map();
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A store page that answers 404, 429 or 5xx has usually not gone away - Play and
+// iTunes both throttle bursts, and a cold Play listing can 404 for a second or
+// two after publication. Retrying with a widening gap turns those into hits
+// instead of a dead link written to the sheet.
+const RETRY_STATUS = new Set([403, 404, 408, 425, 429, 500, 502, 503, 504]);
+
+async function fetchRetry(url, { attempts = 4, gap = 500, acceptNotFound = false } = {}) {
+  let last = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (attempt) await wait(gap * 2 ** (attempt - 1));
+    try {
+      const response = await fetch(url);
+      if (response.ok) return response;
+      // A 404 that survives every retry is a real one; hand it back so the
+      // caller can move on to the next storefront rather than keep waiting.
+      if (acceptNotFound && response.status === 404) return response;
+      if (!RETRY_STATUS.has(response.status)) return response;
+      last = response;
+    } catch (error) {
+      last = null;
+    }
+  }
+  return last;
+}
+
 function decodeHtml(value = "") {
   return value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
@@ -154,6 +181,48 @@ function playContact(html) {
 
 const developerCache = new Map();
 
+// iTunes' lookup endpoint answers for ONE storefront and defaults to "us", so
+// an app that has not launched in the US comes back with zero results. AppBird
+// tracks soft launches, where that is common rather than rare, so a miss walks
+// the storefronts studios actually soft-launch in before giving up.
+const APPLE_STOREFRONTS = ["us", "au", "ca", "nz", "gb", "ph", "vn", "id",
+                           "th", "my", "tr", "br", "pl", "se"];
+
+async function appleLookup(id, extra = "") {
+  for (const store of APPLE_STOREFRONTS) {
+    try {
+      const url = `https://itunes.apple.com/lookup?id=${encodeURIComponent(id)}`
+                + `&country=${store}&lang=en_us${extra}`;
+      const response = await fetchRetry(url, { attempts: 3, acceptNotFound: true });
+      if (!response?.ok) continue;
+      const results = (await response.json()).results || [];
+      if (results.length) return { results, store };
+    } catch {
+      // Try the next storefront rather than failing the whole lookup.
+    }
+  }
+  return { results: [], store: "" };
+}
+
+// Play serves a listing per country too. A soft launch limited to, say, the
+// Philippines 404s on the default storefront, so a miss walks the same regions
+// before the app is treated as genuinely unreachable.
+const PLAY_REGIONS = ["us", "au", "ca", "gb", "ph", "vn", "id", "th", "tr", "br"];
+
+async function playDetails(appId) {
+  const base = `https://play.google.com/store/apps/details?id=${encodeURIComponent(appId)}`;
+  for (const region of PLAY_REGIONS) {
+    const response = await fetchRetry(`${base}&hl=en&gl=${region}`, { attempts: 3, acceptNotFound: true });
+    if (!response?.ok) continue;
+    const html = await response.text();
+    // The URL kept for the sheet is the plain one: it resolves for any reader
+    // whose own storefront carries the app, and the region here was only a way
+    // in. It is recorded only once a real listing has answered.
+    return { html, url: region === "us" ? base : `${base}&gl=${region}` };
+  }
+  return null;
+}
+
 async function developerStats(store, publisher, artistId) {
   // How many apps the developer has published. Cached per developer -
   // a results page repeats the same publisher many times.
@@ -162,18 +231,21 @@ async function developerStats(store, publisher, artistId) {
   let stats = { gameCount: "", developerUrl: "" };
   try {
     if (store === "App Store" && artistId) {
-      const response = await fetch(`https://itunes.apple.com/lookup?id=${encodeURIComponent(artistId)}&entity=software&limit=200`);
-      const results = (await response.json()).results || [];
+      const { results } = await appleLookup(artistId, "&entity=software&limit=200");
       const apps = results.filter((item) => item.wrapperType === "software");
       stats = {
         gameCount: apps.length ? String(apps.length) : "",
-        developerUrl: (results[0]?.artistViewUrl || "").split("?")[0]
+        // The artist wrapper carries artistLinkUrl; only the software entries
+        // carry artistViewUrl. Reading the wrong one leaves the link blank.
+        developerUrl: (results[0]?.artistLinkUrl
+                       || apps[0]?.artistViewUrl || "").split("?")[0]
       };
     } else if (publisher) {
       // Play caps public developer listings at 50, so a full house is
       // reported as "50+" rather than a number that would understate it.
       const query = encodeURIComponent(`pub:"${publisher}"`);
-      const html = await (await fetch(`https://play.google.com/store/search?q=${query}&c=apps&hl=en`)).text();
+      const search = await fetchRetry(`https://play.google.com/store/search?q=${query}&c=apps&hl=en`);
+      const html = search?.ok ? await search.text() : "";
       const ids = new Set();
       for (const match of html.matchAll(/id=([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)+)/g)) {
         const id = match[1];
@@ -197,8 +269,8 @@ async function resolveMetadata(app) {
   try {
     let metadata;
     if (app.store === "App Store") {
-      const response = await fetch(`https://itunes.apple.com/lookup?id=${encodeURIComponent(app.id)}`);
-      const result = (await response.json()).results?.[0];
+      const { results: found } = await appleLookup(app.id);
+      const result = found[0];
       // The iTunes lookup API publishes no contact address, so email stays blank.
       if (result) {
         // Apple publishes no seller address, so country and phone stay blank.
@@ -206,7 +278,10 @@ async function resolveMetadata(app) {
         metadata = {
           game: result.trackName || "",
           publisher: result.artistName || "",
-          storeUrl: result.trackViewUrl || "",
+          // Apple's own canonical link, storefront and slug included. Building
+          // one from the id alone gives https://apps.apple.com/app/id123, which
+          // 404s for anything not on the US store.
+          storeUrl: (result.trackViewUrl || "").split("?")[0],
           publisherEmail: "",
           website: result.sellerUrl || "",
           country: "",
@@ -218,16 +293,25 @@ async function resolveMetadata(app) {
                                          "", result.sellerUrl || "")
         };
       } else {
-        metadata = {};
+        // Not carried by any storefront we tried. A search on the app's name
+        // still opens a real page; an id-only link would 404.
+        metadata = app.name
+          ? { storeUrl: `https://apps.apple.com/us/search?term=${encodeURIComponent(app.name)}` }
+          : {};
       }
     } else {
-      const response = await fetch(`https://play.google.com/store/apps/details?id=${encodeURIComponent(app.id)}&hl=en`);
-      const html = await response.text();
+      const page = await playDetails(app.id);
+      // Unreachable in every region after retrying. The card's own Play URL is
+      // still the canonical one and starts working as the listing propagates,
+      // so it stands as the fallback - but nothing is scraped off a page that
+      // never answered.
+      if (!page) return {};
+      const { html, url: playUrl } = page;
       const contact = playContact(html);
       metadata = {
         game: firstMatch(html, [/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i, /<meta[^>]+itemprop="name"[^>]+content="([^"]+)"/i]).replace(/\s+-\s+Apps on Google Play$/i, ""),
         publisher: firstMatch(html, [/href="\/store\/apps\/dev(?:eloper)?\?id=[^"]+"[^>]*>(?:<[^>]+>)*\s*([^<]{1,80}?)\s*</i]) || contact.legalName,
-        storeUrl: `https://play.google.com/store/apps/details?id=${app.id}`,
+        storeUrl: playUrl,
         publisherEmail: contact.publisherEmail,
         country: contact.country,
         phone: contact.phone,
